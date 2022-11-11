@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=64.0.0", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "rexgrid"
+description = "Regrid xarray and xugrid data"
+readme = { file = "README.rst", content-type = "text/x-rst" }
+version = "0.1.0"
+maintainers = [
+    { name = "Huite Bootsma", email = "huite.bootsma@deltares.nl" }
+]
+requires-python = ">=3.8"
+dependencies = [
+    'xarray',
+    'xugrid',
+]
+classifiers = [
+    'Development Status :: 2 - Pre-Alpha',
+    'Intended Audience :: Science/Research',
+    'License :: OSI Approved :: MIT License',
+    'Programming Language :: Python',
+    'Operating System :: OS Independent',
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.8',
+    'Programming Language :: Python :: 3.9',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: Implementation :: CPython',
+    'Topic :: Scientific/Engineering',
+]
+license = { text = "MIT" }
+
+[project.urls]
+Home = "https://github.com/deltares/rexgrid"
+Code = "https://github.com/deltares/rexgrid"
+Issues = "https://github.com/deltares/rexgrid/issues"
+
+
+[tool.setuptools]
+packages = ["rexgrid"]
+license-files = ["LICENSE"]
+
+[tool.isort]
+profile = "black"
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "@abc.abstractmethod",
+  "@abc.abstractproperty",
+]
