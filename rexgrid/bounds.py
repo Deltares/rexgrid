@@ -67,7 +67,7 @@ def coords_to_bounds(
         spacing_shape = spacing.shape
         if len(spacing_shape) > 1:
             raise NotImplementedError(
-                f"More than one dimension on spacing variable: {spacing_name}"
+                f"More than one dimension in spacing variable: {spacing_name}"
             )
 
         if spacing_shape in ((), (1,)):
