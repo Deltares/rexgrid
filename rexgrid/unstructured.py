@@ -1,9 +1,11 @@
 import numpy as np
 
-from .utils import create_linear_index, create_weights, overlap_1d_nd
+from .structured import StructuredGrid1d
+from .overlap_1d import overlap_1d_nd
+from .utils import broadcast
 
 
-class UnstructuredGridWrapper2d:
+class UnstructuredGrid2d:
     """
     e.g. face -> face
 
@@ -14,30 +16,30 @@ class UnstructuredGridWrapper2d:
 
     def __init__(self, grid):
         self.grid = grid
+        
+    def shape(self):
+        return self.grid.n_face
 
     def area(self):
         return self.grid.area
 
-    def overlap(self, other):
+    def overlap(self, other, relative: bool):
         """
         Parameters
         ----------
-        other: UnstructuredGridWrapper2d
+        other: UnstructuredGrid2d
         """
         target_index, source_index, weights = self.grid.celltree.intersect_faces(
             vertices=other.grid.node_coordinates,
             faces=other.grid.face_node_connectivity,
             fill_value=other.grid.fill_value,
         )
-        return target_index, source_index, weights
-
-    def relative_overlap(self, other):
-        target_index, source_index, weights = self.overlap(other)
-        weights /= self.area[source_index]
+        if relative:
+            weights /= self.area[source_index]
         return source_index, target_index, weights
 
 
-class UnstructuredPrismaticGridWrapper3d(UnstructuredGridWrapper2d):
+class UnstructuredPrismaticGrid3d(UnstructuredGrid2d):
     """
     e.g. (face, z) -> (face, z)
 
@@ -48,60 +50,22 @@ class UnstructuredPrismaticGridWrapper3d(UnstructuredGridWrapper2d):
     """
 
     def __init__(self, grid, zbounds):
-        self.grid = grid
-        self.zbounds = StructuredGridWrapper1d(zbounds)
+        self.xygrid = UnstructuredGrid2d(grid)
+        self.zbounds = StructuredGrid1d(zbounds)
 
-    def _broadcast_overlap(
-        self,
-        other,
-        source_index_z,
-        source_index_yx,
-        target_index_z,
-        target_index_yx,
-        weights_z,
-        weights_yx,
-    ):
-        source_index = create_linear_index(
-            (source_index_z, source_index_yx), (self.zbounds.size, self.grid.n_face)
-        )
-        target_index = create_linear_index(
-            (target_index_z, target_index_yx), (other.zbounds.size, other.grid.n_face)
-        )
-        weights = create_weights((weights_z, weights_yx))
-        return source_index, target_index, weights
-
-    def overlap(self, other):
-        target_index_z, source_index_z, weights_z = self.zbounds(other.zbounds)
-        target_index_yx, source_index_yx, weights_yx = super(self).overlap(other)
-        return self._broadcast_overlap(
-            other,
-            source_index_z,
-            source_index_yx,
-            target_index_z,
-            target_index_yx,
-            weights_z,
-            weights_yx,
-        )
-
-    def relative_overlap(self, other):
-        target_index_z, source_index_z, weights_z = self.zbounds.relative_overlap(
-            other.zbounds
-        )
-        target_index_yx, source_index_yx, weights_yx = super(self).relative_overlap(
-            other
-        )
-        return self._broadcast_overlap(
-            other,
-            source_index_z,
-            source_index_yx,
-            target_index_z,
-            target_index_yx,
-            weights_z,
-            weights_yx,
+    def overlap(self, other, relative):
+        source_index_z, target_index_z, weights_z = self.zbounds.overlap(other.zbounds, relative)
+        source_index_yx, target_index_yx, weights_yx = self.xygrid.overlap(other, relative)
+        return broadcast(
+            self.shape,
+            other.shape,
+            (source_index_z, source_index_yx),
+            (target_index_z, target_index_yx),
+            (weights_z, weights_yx),
         )
 
 
-class ExplicitUnstructuredPrismaticGridWrapper(UnstructuredGridWrapper2d):
+class ExplicitUnstructuredPrismaticGrid(UnstructuredGrid2d):
     """
     (face, z(face)) -> (face, z(face))
 
@@ -111,22 +75,27 @@ class ExplicitUnstructuredPrismaticGridWrapper(UnstructuredGridWrapper2d):
     """
 
     def __init__(self, grid, zbounds):
-        self.grid = grid
+        self.xygrid = UnstructuredGrid2d(grid)
         self.zbounds = zbounds
+        
+    def length(self):
+        return np.diff(self.zbounds, axis=-1)
 
-    def volume(self):
-        height = abs(np.diff(self.zbounds, axis=-1))
-        return height * self.area()
-
-    def overlap(self, other):
-        target_index_yx, source_index_yx, weights_yx = super(self).overlap(other)
-        target_index, source_index, weights_z = overlap_1d_nd(
+    def overlap(self, other, relative):
+        source_index_yx, target_index_yx, weights_yx = self.xygrid.overlap(other, relative)
+        source_index, target_index, weights_z = overlap_1d_nd(
             self.zbounds, other.zbounds, source_index_yx, target_index_yx
         )
+        if relative:
+            weights_z /= self.length().ravel().sournce_index
         weights = weights_z * weights_yx
-        return target_index, source_index, weights
-
-    def relative_overlap(self, other):
-        target_index, source_index, weights = self.overlap(other)
-        weights /= self.volume().ravel()[source_index]
         return source_index, target_index, weights
+
+
+GRIDS = {
+#   1D,2D,3D
+    (1, 0, 0): StructuredGrid1d,
+    (0, 1, 0): UnstructuredGrid2d,
+    (1, 1, 0): UnstructuredPrismaticGrid3d,
+    (1, 0, 1): ExplicitUnstructuredPrismaticGrid,
+}

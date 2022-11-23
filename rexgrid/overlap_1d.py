@@ -1,8 +1,7 @@
-"""
-Utilities to compute weights along a 1D axis.
-"""
 import numba
 import numpy as np
+
+from .utils import alt_cumsum
 
 
 @numba.njit(inline="always")
@@ -137,17 +136,6 @@ find_lower_indices = _find_indices("right")
 find_upper_indices = _find_indices("left")
 
 
-def alt_cumsum(a):
-    """
-    Alternative cumsum, always starts at 0 and omits the last value of the
-    regular cumsum.
-    """
-    out = np.empty(a.size, a.dtype)
-    out[0] = 0
-    np.cumsum(a[:-1], out=out[1:])
-    return out
-
-
 def vectorized_overlap(bounds_a, bounds_b):
     """
     Vectorized overlap computation.
@@ -246,7 +234,7 @@ def overlap_1d_nd(
         target_bounds.reshape((-1, 2))[target_linear_index],
     )
     valid = overlap > 0.0
-    return (source_linear_index[valid], target_linear_index[valid], overlap[valid])
+    return (source_index[valid], target_index[valid], overlap[valid])
 
 
 def overlap_1d(

@@ -6,18 +6,13 @@ other.
 While the unstructured logic would work for structured data as well, it is much
 less efficient than utilizing the structure of the coordinates.
 """
-from typing import Union
-
-import numba
 import numpy as np
-import pandas as pd
-import xarray as xr
-from scipy import sparse
 
-from .utils import alt_cumsum, create_linear_index, create_weights, overlap_1d
+from .utils import broadcast
+from .overlap_1d import overlap_1d, overlap_1d_nd
 
 
-class StructuredGridWrapper1d:
+class StructuredGrid1d:
     """
     e.g. z -> z; so also works for unstructured
 
@@ -28,21 +23,23 @@ class StructuredGridWrapper1d:
 
     def __init__(self, bounds):
         self.bounds = bounds
-        self.size = len(bounds)
+        
+    @property
+    def size(self):
+        return len(self.bounds)
 
-    def overlap(self, other):
-        return overlap_1d(self.bounds, other.bounds)
+    def overlap(self, other, relative: bool):
+        source_index, target_index, weights = overlap_1d(self.bounds, other.bounds)
+        if relative:
+            weights /= self.length()[source_index]
+        return source_index, target_index, weights
 
     def length(self):
         return abs(np.diff(self.bounds, axis=1))
-
-    def relative_overlap(self, other):
-        source_index, target_index, weights = self.overlap(other)
-        weights /= self.length()[source_index]
-        return source_index, target_index, weights
+    
 
 
-class StructuredGridWrapper2d:
+class StructuredGrid2d:
     """
     e.g. (x,y) -> (x,y)
 
@@ -57,194 +54,114 @@ class StructuredGridWrapper2d:
         xbounds,
         ybounds,
     ):
-        self.xbounds = StructuredGridWrapper1d(xbounds)
-        self.ybounds = StructuredGridWrapper1d(ybounds)
+        self.xbounds = StructuredGrid1d(xbounds)
+        self.ybounds = StructuredGrid1d(ybounds)
+        
+    @property
+    def shape(self):
+        return (self.ybounds.size, self.xbounds.size)
 
-    def _broadcast_overlap(
-        self,
-        other,
-        source_index_y,
-        source_index_x,
-        target_index_y,
-        target_index_x,
-        weights_y,
-        weights_x,
-    ):
-        source_index = create_linear_index(
-            (source_index_y, source_index_x), (self.ybounds.size, self.xbounds.size)
-        )
-        target_index = create_linear_index(
-            (target_index_y, target_index_x), (other.ybounds.size, other.xbounds.size)
-        )
-        weights = create_weights((weights_y, weights_x))
-        return source_index, target_index, weights
-
-    def overlap(self, other):
-        source_index_x, target_index_x, weights_x = self.xbounds.overlap(other.xbounds)
-        source_index_y, target_index_y, weights_y = self.ybounds.overlap(other.ybounds)
-        return self._broadcast_overlap(
-            other,
-            source_index_y,
-            source_index_x,
-            target_index_y,
-            target_index_x,
-            weights_y,
-            weights_x,
-        )
-
-    def relative_overlap(self, other):
-        source_index_x, target_index_x, weights_x = self.xbounds.relative_overlap(
-            other.xbounds
-        )
-        source_index_y, target_index_y, weights_y = self.ybounds.relative_overlap(
-            other.ybounds
-        )
-        return self._broadcast_overlap(
-            other,
-            source_index_y,
-            source_index_x,
-            target_index_y,
-            target_index_x,
-            weights_y,
-            weights_x,
+    def overlap(self, other, relative: bool):
+        source_index_x, target_index_x, weights_x = self.xbounds.overlap(other.xbounds, relative)
+        source_index_y, target_index_y, weights_y = self.ybounds.overlap(other.ybounds, relative)
+        return broadcast(
+            self.shape,
+            other.shape,
+            (source_index_y, source_index_x),
+            (target_index_y, target_index_x),
+            (weights_y, weights_x),
         )
 
 
-class StructuredGridWrapper3d:
+class StructuredGrid3d:
     """e.g. (x,y,z) -> (x,y,z)"""
 
     def __init__(self, xbounds, ybounds, zbounds):
-        self.xbounds = StructuredGridWrapper1d(xbounds)
-        self.ybounds = StructuredGridWrapper1d(ybounds)
-        self.zbounds = StructuredGridWrapper1d(zbounds)
+        self.xbounds = StructuredGrid1d(xbounds)
+        self.ybounds = StructuredGrid1d(ybounds)
+        self.zbounds = StructuredGrid1d(zbounds)
 
-    def _broadcast_overlap(
-        self,
-        other,
-        source_index_z,
-        source_index_y,
-        source_index_x,
-        target_index_z,
-        target_index_y,
-        target_index_x,
-        weights_y,
-        weights_x,
-        weights_z,
-    ):
-        source_index = create_linear_index(
+    def overlap(self, other, relative):
+        source_index_x, target_index_x, weights_x = self.xbounds.overlap(
+            other.xbounds, relative
+        )
+        source_index_y, target_index_y, weights_y = self.ybounds.overlap(
+            other.ybounds, relative
+        )
+        source_index_z, target_index_z, weights_z = self.zbounds.overlap(
+            other.zbounds, relative
+        )
+        return broadcast(
+            self.shape,
+            other.shape,
             (source_index_z, source_index_y, source_index_x),
-            (self.ybounds.size, self.xbounds.size),
-        )
-        target_index = create_linear_index(
             (target_index_z, target_index_y, target_index_x),
-            (other.ybounds.size, other.xbounds.size),
+            (weights_z, weights_y, weights_x),
         )
-        weights = create_weights((weights_y, weights_x))
+        
+
+class ExplicitGrid:
+    def __init__(self, zbounds):
+        nz = zbounds.shape[-1]
+        self.zbounds = zbounds.reshape(-1, nz, 2)
+
+    def length(self):
+        return np.diff(self.zbounds, axis=-1)
+    
+    def overlap(self, other, relative: bool):
+        source_index = target_index = np.arange(self.zbounds.shape[0])
+        source_index, target_index, weights = overlap_1d_nd(
+            self.zbounds, other.zbounds, source_index, target_index
+        )
+        if relative:
+            weights_z /= self.length.ravel()[source_index]
         return source_index, target_index, weights
 
-    def overlap(self, other):
-        source_index_x, target_index_x, weights_x = self.xbounds.relative_overlap(
-            other.xbounds
-        )
-        source_index_y, target_index_y, weights_y = self.ybounds.relative_overlap(
-            other.ybounds
-        )
-        source_index_z, target_index_z, weights_z = self.zbounds.relative_overlap(
-            other.zbounds
-        )
-        return self._broadcast_overlap(
-            other,
-            source_index_z,
-            source_index_y,
-            source_index_x,
-            target_index_z,
-            target_index_y,
-            target_index_x,
-            weights_y,
-            weights_x,
-            weights_z,
-        )
 
-
-class ExplicitStructuredGridWrapper2d:
-    """e.g. z(x) -> z(x), also for unstructured"""
-
-
-class ExplicitStructuredGridWrapper3d:
-    """e.g. z(x,y) -> z(x, y)"""
-
-
-def linear_interpolation_weights_1d(source_x, target_x):
+class ExplicitStructuredGrid3d(ExplicitGrid):
     """
-    Returns indices and weights for linear interpolation along a single dimension.
-    A sentinel value of -1 is added for target cells that are fully out of bounds.
-
-    Parameters
-    ----------
-    source_x : np.array
-        vertex coordinates of source
-    target_x: np.array
-        vertex coordinates of target
+    e.g. z(y, x) -> z(y, x)
+    
+    Promote to explicit bounds if not yet available.
     """
-    # Cannot interpolate "between" only one point
-    if not source_x.size > 2:
-        raise ValueError(
-            "source_x must larger than 2. Cannot interpolate with only a point"
+    def __init__(self, xbounds, ybounds, zbounds):
+        self.xbounds = StructuredGrid1d(xbounds)
+        self.ybounds = StructuredGrid1d(ybounds)
+        nz = zbounds.shape[-1]
+        self.zbounds = zbounds.reshape(-1, nz, 2)
+        
+    def length(self):
+        return np.diff(self.zbounds, axis=-1)
+        
+    def overlap(self, other, relative):
+        source_index_x, target_index_x, weights_x = self.xbounds.overlap(
+            other.xbounds, relative
         )
+        source_index_y, target_index_y, weights_y = self.ybounds.overlap(
+            other.ybounds, relative
+        )
+        source_index_yx, target_index_yx, weights_yx = broadcast(
+            self.shape[1:],
+            other.shape[1:],
+            (source_index_y, source_index_x),
+            (target_index_y, target_index_x),
+            (weights_y, weights_x),
+        )
+        source_index, target_index, weights_z = overlap_1d_nd(
+            self.zbounds, other.zbounds, source_index_yx, target_index_yx
+        )
+        if relative:
+            weights_z /= self.length.ravel()[source_index]
+        weights = weights_z * weights_yx
+        return source_index, target_index, weights
 
-    xmin = source_x.min()
-    xmax = source_x.max()
 
-    # Compute midpoints for linear interpolation
-    source_dx = np.diff(source_x)
-    mid_source_x = source_x[:-1] + 0.5 * source_dx
-    target_dx = np.diff(target_x)
-    mid_target_x = target_x[:-1] + 0.5 * target_dx
-
-    # From np.searchsorted docstring:
-    # Find the indices into a sorted array a such that, if the corresponding
-    # elements in v were inserted before the indices, the order of a would
-    # be preserved.
-    i = np.searchsorted(mid_source_x, mid_target_x) - 1
-    # Out of bounds indices
-    i[i < 0] = 0
-    i[i > mid_source_x.size - 2] = mid_source_x.size - 2
-    valid = (mid_target_x >= source_x[i]) & (mid_target_x < source_x[i + 1])
-    i = i[valid]
-    j = np.arange(mid_source_x.size)[valid]
-
-    # -------------------------------------------------------------------------
-    # Visual example: interpolate from source with 2 cells to target 3 cells
-    # The period . marks the midpoint of the cell
-    # The pipe | marks the cell edge
-    #
-    #    |_____._____|_____._____|
-    #    source_x0      source_x1
-    #
-    #    |___.___|___.___|___.___|
-    #        x0      x1      x2
-    #
-    # Then normalized weight for cell x1:
-    # weight = (x1 - source_x0) / (source_x1 - source_x0)
-    # -------------------------------------------------------------------------
-
-    norm_weights = (mid_target_x - mid_source_x[i]) / (
-        mid_source_x[i + 1] - mid_source_x[i]
-    )
-    # deal with out of bounds locations
-    # we place a sentinel value of -1 here
-    i[mid_target_x < xmin] = -1
-    i[mid_target_x > xmax] = -1
-    # In case it's just inside of bounds, use only the value at the boundary
-    norm_weights[norm_weights < 0.0] = 0.0
-    norm_weights[norm_weights > 1.0] = 1.0
-
-    # Interlace i and weights
-    jj = np.repeat(j, 2)
-    ii = np.empty(jj.size, dtype=int)
-    ii[::2] = i
-    ii[1::2] = i + 1
-    weights = np.empty(jj.size)
-    weights[::2] = norm_weights
-    weights[1::2] = 1.0 - norm_weights
-    return i, j, weights
+GRIDS = {
+#   1D 2D 3D
+    (1, 0, 0): StructuredGrid1d,
+    (2, 0, 0): StructuredGrid2d,
+    (3, 0, 0): StructuredGrid3d,
+    (0, 1, 0): ExplicitGrid,
+    (0, 0, 1): ExplicitGrid,
+    (2, 0, 1): ExplicitStructuredGrid3d,
+}

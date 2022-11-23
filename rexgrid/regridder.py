@@ -2,6 +2,43 @@
 Types are your friend!
 
 Use xarray broadcasting for selection?
+
+1. structured -> structured
+2. structured -> unstructured
+3. unstructured -> structured
+4. unstructured -> unstructured
+
+Note: i -> j can be inverted to j -> v.
+
+1a. Overlap: easy, compute and broadcast-multiply.
+1b. Interpolation: easy, bilinear between four neighbors.
+
+2a. Overlap: search unstructured bounding boxes on structured. More efficient than
+conversion to unstructured, building celltree, then searching.
+2b. Interpolation: easy, bilinear between four neighbors.
+
+3a. Overlap: inverse of 2a.
+3b. Interpolation: requires natural neighbor, IDW.
+
+4a. Overlap: search celltree. Compute overlap.
+4b. Interpolation: requires natural neighbor, IDW.
+
+Conclusion: 2a, 3a could be optimized by using a grid search than celltree search.
+Others require different classes?
+Not all logic differs. Probably better to create Grid classes which implement
+weighting procedures?
+
+*   *
+  *
+
+Xugrid explicitly targets spatial data.
+
+While arbitrary dimensionality could be supported with sufficient (obtuse?)
+abstraction, two to three spatial dimension is much easier to comprehend.
+
+ or Adapter?
+
+Based on dimension to regrid, decide on a regridder.
 """
 import abc
 from itertools import chain
@@ -10,60 +47,21 @@ from typing import Callable, NamedTuple, Optional, Tuple, Union
 import numba
 import numpy as np
 import xarray as xr
-from numba.core.extending import register_jitable
+import xugrid as xu
 
-from ..ugrid import Ugrid2d
-from ..ugrid_dataset import UgridDataArray
+from xugrid import Ugrid2d, UgridDataArray
 from . import reduce, weights_1d
+from .typing import FloatArray, IntArray
 from .unstructured import (
-    ExplicitUnstructuredPrismaticGridWrapper,
-    UnstructuredGridWrapper2d,
-    UnstructuredPrismaticGridWrapper3d,
+    ExplicitUnstructuredPrismaticGrid,
+    UnstructuredGrid2d,
+    UnstructuredPrismaticGrid3d,
 )
-
-
-IntArray = np.ndarray
-FloatArray = np.ndarray
-
-
-class WeightMatrixCSR(NamedTuple):
-    """
-    NamedTuple for easy ingestion by numba.
-    """
-
-    indptr: IntArray
-    indices: IntArray
-    weights: FloatArray
-    n: int
-    nnz: int
-
-
-def create_weight_matrix(
-    target_index: IntArray,
-    source_index: IntArray,
-    weights: FloatArray,
-):
-    i = np.cumsum(np.bincount(target_index))
-    indptr = np.empty(i.size + 1)
-    indptr[0] = 0
-    indptr[1:] = i
-    return WeightMatrixCSR(
-        indptr,
-        source_index,
-        weights,
-        indptr.size - 1,
-        source_index.size,
-    )
-
-
-@numba.njit(inline="always")
-def nzrange(A: WeightMatrixCSR, row: int) -> Tuple[IntArray, FloatArray]:
-    """
-    Return the indices and values of a single row
-    """
-    start = A.indptr[row]
-    end = A.indptr[row + 1]
-    return A.indices[start:end], A.weights[start:end]
+from .weight_matrix import (
+    create_weight_matrix,
+    WeightMatrixCSR,
+    nzrange,
+)
 
 
 def _check_ugrid(a, b):
@@ -206,8 +204,8 @@ class UnstructuredOverlapRegridder:
         target: UgridDataArray,
         method: Union[str, Callable] = "mean",
     ):
-        self.source: Ugrid2d = UnstructuredGridWrapper2d(source)
-        self.target: Ugrid2d = UnstructuredGridWrapper2d(target)
+        self.source: Ugrid2d = UnstructuredGrid2d(source)
+        self.target: Ugrid2d = UnstructuredGrid2d(target)
         func = reduce.get_method(method, reduce.OVERLAP_METHODS)
         self._setup_regrid(func)
         self.compute_weights()
@@ -217,7 +215,7 @@ class UnstructuredOverlapRegridder:
         Use a closure to capture func.
         """
 
-        f = register_jitable(func)
+        f = numba.njit(func)
 
         @numba.njit(parallel=True)
         def _regrid(A: WeightMatrixCSR, source: FloatArray, out: FloatArray):
@@ -230,7 +228,7 @@ class UnstructuredOverlapRegridder:
         return
 
     def compute_weights(self):
-        self.target_index, self.source_index, self.weights = self.source.overlap(
+        self.source_index, self.target_index, self.weights = self.source.overlap(
             self.target
         )
         return
@@ -278,58 +276,113 @@ class UnstructuredOverlapRegridder:
             regridded,
             target.grid,
         )
+        
+
+def is_xarray(obj):
+    return isinstance(obj, xr.DataArray)
 
 
-class UnstructuredRelativeOverlapRegridder(UnstructuredOverlapRegridder):
-    def compute_weights(self):
-        super().compute_weights()
-        self.weights /= self.source.area()[self.source_index]
+def is_ugrid(obj):
+    return isinstance(obj, xu.UgridDataArray)
 
 
-class StructuredGridWrapper:
+def to_ascending(obj):
     """
-    Only supports axis-aligned coordinates (1D).
+    Ensure all coordinates are (monotonic) ascending.
+    """
+    
+
+
+from collections import defaultdict
+
+def structured(
+    source,
+    target,
+    method,
+):
+    regrid_dims = set(source.dims).intersection(target.dims)
+    # check common coordinates and dimensions
+    source_coords = {dim: source[dim] for dim in regrid_dims}
+    target_coords = {dim: target[dim] for dim in regrid_dims}
+    # Gather all coordinates with dimensions
+    source_ndim = {coord: source.coords[dim].ndim for dim in regrid_dims}
+    target_ndim = {coord: target.coords[dim].ndim for dim in regrid_dims}
+    
+    if any(ndim > 3 for ndim in chain(source_ndim, target_ndim)):
+        raise ValueError("Cannot regrid more than 3 dimensions")
+    counter = defaultdict(int)
+    for ndim in source_ndim.values():
+        counter[ndim] += 1
+
+    regrid_key = (
+        counter[0],
+        counter[1],
+        counter[2],
+    )
+    grid = structured.GRIDS[regrid_key]
+
+
+def unstructured(
+    source,
+    target,
+    method,
+):
+    source_grid = source.ugrid.grid
+    target_grid = target.ugrid.grid
+    skip = (
+        source_grid.face_dimension,
+        source_grid.edge_dimension,
+        source_grid.node_dimension,
+        target_grid.face_dimension,
+        target_grid.edge_dimension,
+        target_grid.node_dimension,
+    )
+    regrid_dims = [
+        dim for dim in set(source.dims).intersection(target.dims) if dim not in skip
+    ]
+
+    counter = defaultdict(int)
+    if source_grid != target_grid:
+        counter[1] += 1
+    
+    
+
+    regrid_key = (
+        counter[0],
+        counter[1],
+        counter[2],
+    )
+    grid = unstructured.GRIDS[regrid_key]
+
+
+def structured_unstructured(
+    source,
+    target,
+    method,
+):
+    """
+    Make sure the result is a structured output.
     """
 
-    def __init__(self, coord_bounds):
-        self.coord_bounds = coord_bounds
 
-    def area(self, dim0, dim1):
-        length0 = self.length(dim0)
-        length1 = self.length(dim1)
-        return np.multiply.outer(length0, length1)
-
-    def volume(self, dim0, dim1, dim2):
-        length0 = self.length(dim0)
-        length1 = self.length(dim1)
-        length2 = self.length(dim2)
-        return np.multiply.outer(np.multiply.outer(length0, length1), length2)
-
-
-class StructuredGridWrapper1d:
-    """e.g. z -> z; also works for unstructured"""
-
-    def overlap(self, other):
-        return weights_1d.overlap_1d(self.xbounds, other.xbounds)
-
-
-class StructuredGridWrapper2d:
-    """e.g. (x,y) -> (x,y)"""
-
-    def overlap(self, other):
-        yw = weights_1d.overlap_1d(self.ybounds, other.ybounds)
-        xw = weights_1d.overlap_1d(self.xbounds, other.xbounds)
-        return np.multiply.outer(yw, xw)
-
-
-class StructuredGridWrapper3d:
-    """e.g. (x,y,z) -> (x,y,z)"""
-
-    def overlap(self, other):
-        yw = weights_1d.overlap_1d(self.ybounds, other.ybounds)
-        xw = weights_1d.overlap_1d(self.xbounds, other.xbounds)
-        zw = weights_1d.overlap_1d(self.zbounds, other.zbounds)
-        return np.multiply.outer(
-            zw,
-            np.multiply.outer(yw, xw),
+def create_regridder(
+    source,
+    target,
+    method,
+):
+    # 2 by 2 options.
+    if is_xarray(source) and is_xarray(target):
+        return structured(source, target, method)
+    elif is_xarray(source) and is_ugrid(target):
+        usource = xu.UgridDataArray.from_structured(source)
+        return unstructured(usource, target, method)
+    elif is_ugrid(source) and is_xarray(target):
+        return unstructured_structured(source, target, method)
+    elif is_ugrid(source) and is_ugrid(target):
+        return unstructured(source, target, method)
+    else:
+        raise TypeError(
+            "source and target should be DataArray or UgridDataArray"
         )
+        
+
