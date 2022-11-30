@@ -8,7 +8,7 @@ from typing import NamedTuple, Tuple
 import numba
 import numpy as np
 
-from .typing import IntArray, FloatArray
+from .typing import FloatArray, IntArray
 
 
 class WeightMatrixCSR(NamedTuple):

@@ -36,32 +36,33 @@ Xugrid explicitly targets spatial data.
 While arbitrary dimensionality could be supported with sufficient (obtuse?)
 abstraction, two to three spatial dimension is much easier to comprehend.
 
- or Adapter?
+*   *
+  *
 
-Based on dimension to regrid, decide on a regridder.
+This module is heavily inspired by xemsf.frontend.py
 """
 import abc
 from itertools import chain
-from typing import Callable, NamedTuple, Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
+import dask
 import numba
 import numpy as np
 import xarray as xr
-import xugrid as xu
-
 from xugrid import Ugrid2d, UgridDataArray
-from . import reduce, weights_1d
-from .typing import FloatArray, IntArray
-from .unstructured import (
-    ExplicitUnstructuredPrismaticGrid,
-    UnstructuredGrid2d,
-    UnstructuredPrismaticGrid3d,
-)
-from .weight_matrix import (
-    create_weight_matrix,
-    WeightMatrixCSR,
-    nzrange,
-)
+
+from . import reduce
+from .typing import FloatArray
+from .unstructured import UnstructuredGrid2d
+from .weight_matrix import WeightMatrixCSR, create_weight_matrix, nzrange
+
+
+def is_xarray(obj):
+    return isinstance(obj, xr.DataArray)
+
+
+def is_ugrid(obj):
+    return isinstance(obj, UgridDataArray)
 
 
 def _check_ugrid(a, b):
@@ -83,14 +84,6 @@ def _get_grid_variables(ds: xr.Dataset, prefix: str):
         for v in chain(ds.data_vars, ds.dims)
     }
     return ds.rename(name_dict)
-
-
-def fast_isel(object, indexer):
-    """
-    Might be smart?
-
-    See: https://github.com/pydata/xarray/issues/2227
-    """
 
 
 class BaseRegridder(abc.ABC):
@@ -145,9 +138,8 @@ class BaseRegridder(abc.ABC):
         )
 
 
-class UnstructuredNearestRegridder(BaseRegridder):
+class NearestRegridder(BaseRegridder):
     def compute_weights(self):
-        # TODO: dispatch on types?
         tree = self.source_grid.celltree
         self.source_index = tree.locate_points(self.target_grid.centroids)
         self.weights = xr.DataArray(
@@ -193,7 +185,7 @@ class UnstructuredNearestRegridder(BaseRegridder):
         return xr.merge((source_ds, target_ds, regrid_ds))
 
 
-class UnstructuredOverlapRegridder:
+class OverlapRegridder:
     """
     Used for area or volume weighted means.
     """
@@ -203,12 +195,13 @@ class UnstructuredOverlapRegridder:
         source: UgridDataArray,
         target: UgridDataArray,
         method: Union[str, Callable] = "mean",
+        relative: bool = False,
     ):
         self.source: Ugrid2d = UnstructuredGrid2d(source)
         self.target: Ugrid2d = UnstructuredGrid2d(target)
         func = reduce.get_method(method, reduce.OVERLAP_METHODS)
         self._setup_regrid(func)
-        self.compute_weights()
+        self.compute_weights(relative)
 
     def _setup_regrid(self, func) -> None:
         """
@@ -218,18 +211,79 @@ class UnstructuredOverlapRegridder:
         f = numba.njit(func)
 
         @numba.njit(parallel=True)
-        def _regrid(A: WeightMatrixCSR, source: FloatArray, out: FloatArray):
-            for target_index in numba.prange(A.n):
-                indices, weights = nzrange(A, target_index)
-                out[target_index] = f(source, indices, weights)
-            return
+        def _regrid(source: FloatArray, A: WeightMatrixCSR, size: int):
+            n_extra = source.shape[0]
+            out = np.full((n_extra, size), np.nan)
+            for extra_index in numba.prange(n_extra):
+                source_flat = source[extra_index]
+                for target_index in range(A.n):
+                    indices, weights = nzrange(A, target_index)
+                    out[extra_index, target_index] = f(source_flat, indices, weights)
+            return out
 
         self._regrid = _regrid
         return
 
-    def compute_weights(self):
+    def regrid_array(self, source):
+        first_dims = source.shape[:-1]
+        last_dims = source.shape[-1:]
+
+        if last_dims != self.source.shape:
+            raise ValueError(
+                "Shape of last source dimensions does not match regridder "
+                f"shape: {last_dims} versus {self.source.shape}"
+            )
+
+        if source.ndim == 1:
+            source = source[np.newaxis]
+        elif source.ndim > 2:
+            source = source.reshape((-1,) + last_dims)
+
+        size = self.target.size
+        out_shape = first_dims + self.target.shape
+
+        if isinstance(source, dask.array.Array):
+            chunks = source.chunks[:-1] + (self.target.shape,)
+            out = dask.array.map_blocks(
+                self._regrid,  # func
+                source,  # *args
+                self.csr_weights,  # *args
+                size,  # *args
+                dtype=np.float64,
+                chunks=chunks,
+                meta=np.array((), dtype=source.dtype),
+            )
+        elif isinstance(source, np.ndarray):
+            out = self._regrid(source, self.csr_weights, size)
+        else:
+            raise TypeError(
+                f"Expected dask.array.Array or numpy.ndarray. Received: {type(source)}"
+            )
+
+        return out.reshape(out_shape)
+
+    def regrid_dataarray(self, source):
+        source_dims = (source.ugrid.grid.face_dimension,)
+        # Do not set vectorize=True: numba will run the for loop more
+        # efficiently, and guarantees a single large allocation.
+        out = xr.apply_ufunc(
+            self.regrid_array,
+            source.ugrid.obj,
+            input_core_dims=[source_dims],
+            exclude_dims=set(source_dims),
+            output_core_dims=[self.target.dims],
+            dask="allowed",
+            keep_attrs=True,
+            output_dtypes=[source.dtype],
+        )
+        return out
+
+    def compute_weights(self, relative):
         self.source_index, self.target_index, self.weights = self.source.overlap(
-            self.target
+            self.target, relative
+        )
+        self.csr_weights = create_weight_matrix(
+            self.target_index, self.source_index, self.weights
         )
         return
 
@@ -238,56 +292,21 @@ class UnstructuredOverlapRegridder:
         return
 
     def regrid(self, object) -> UgridDataArray:
-        grid = object.ugrid.grid
-        facedim = grid.face_dimension
-        # extradims = [dim for dim in object.dims if dim != facedim]
-        # stacked = object.stack(extradims=extradims)
-
-        A = create_weight_matrix(self.target_index, self.source_index, self.weights)
-        target = self.target
-
-        # make this delayed with dask.
-        # optimize with isel/faster isel?
-        # target = self.target_grid
-        # results = []
-        # for coords, object1d in stacked.groupby("extradims", create_index=False):
-        #    source = object1d.values.ravel()
-        #    out = np.full(target.n_face)
-        #    self._regrid(A, source, out)
-        #    da = xr.DataArray(
-        #        out,
-        #        coords=coords,
-        #        dims=[target.face_dimension],
-        #    )
-        #    results.append(da)
-
-        # regridded = xr.concat(results, dim="extradims").unstack("extradims")
-
-        source = object.values.ravel()
-        out = np.full(target.grid.n_face, np.nan)
-        self._regrid(A, source, out)
-        regridded = xr.DataArray(
-            data=out,
-            dims=[facedim],
-            name=object.name,
-        )
-
+        regridded = self.regrid_dataarray(object)
         return UgridDataArray(
             regridded,
-            target.grid,
+            self.target.grid,
         )
-        
-
-def is_xarray(obj):
-    return isinstance(obj, xr.DataArray)
-
-
-def is_ugrid(obj):
-    return isinstance(obj, xu.UgridDataArray)
 
 
 def to_ascending(obj):
     """
     Ensure all coordinates are (monotonic) ascending.
     """
-    
+    dims = obj.dims
+    keep = slice(None, None, 1)
+    flip = slice(None, None, -1)
+    slices = {
+        dim: flip if obj.indexes[dim].is_monotonic_increasing else keep for dim in dims
+    }
+    return obj.isel(slices)

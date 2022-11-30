@@ -8,8 +8,8 @@ less efficient than utilizing the structure of the coordinates.
 """
 import numpy as np
 
+from .overlap_1d import overlap_1d
 from .utils import broadcast
-from .overlap_1d import overlap_1d, overlap_1d_nd
 
 
 class StructuredGrid1d:
@@ -23,7 +23,7 @@ class StructuredGrid1d:
 
     def __init__(self, bounds):
         self.bounds = bounds
-        
+
     @property
     def size(self):
         return len(self.bounds)
@@ -36,7 +36,6 @@ class StructuredGrid1d:
 
     def length(self):
         return abs(np.diff(self.bounds, axis=1))
-    
 
 
 class StructuredGrid2d:
@@ -56,14 +55,18 @@ class StructuredGrid2d:
     ):
         self.xbounds = StructuredGrid1d(xbounds)
         self.ybounds = StructuredGrid1d(ybounds)
-        
+
     @property
     def shape(self):
         return (self.ybounds.size, self.xbounds.size)
 
     def overlap(self, other, relative: bool):
-        source_index_x, target_index_x, weights_x = self.xbounds.overlap(other.xbounds, relative)
-        source_index_y, target_index_y, weights_y = self.ybounds.overlap(other.ybounds, relative)
+        source_index_x, target_index_x, weights_x = self.xbounds.overlap(
+            other.xbounds, relative
+        )
+        source_index_y, target_index_y, weights_y = self.ybounds.overlap(
+            other.ybounds, relative
+        )
         return broadcast(
             self.shape,
             other.shape,

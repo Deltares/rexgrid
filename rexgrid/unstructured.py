@@ -1,8 +1,8 @@
-import numpy as np
-
-from .structured import StructuredGrid1d
-from .overlap_1d import overlap_1d_nd
-from .utils import broadcast
+# import numpy as np
+#
+# from .overlap_1d import overlap_1d_nd
+# from .structured import StructuredGrid1d
+# from .utils import broadcast
 
 
 class UnstructuredGrid2d:
@@ -16,10 +16,20 @@ class UnstructuredGrid2d:
 
     def __init__(self, grid):
         self.grid = grid
-        
+
+    @property
+    def dims(self):
+        return (self.grid.face_dimension,)
+
+    @property
     def shape(self):
+        return (self.grid.n_face,)
+
+    @property
+    def size(self):
         return self.grid.n_face
 
+    @property
     def area(self):
         return self.grid.area
 

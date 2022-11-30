@@ -1,4 +1,3 @@
-import numba
 import numpy as np
 
 
@@ -13,7 +12,7 @@ def create_weights(arrays):
     for dim_weight in meshgrids[1:]:
         weight *= dim_weight
     return weight.ravel()
-    
+
 
 def broadcast(
     source_shape,
