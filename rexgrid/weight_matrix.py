@@ -14,6 +14,8 @@ from .typing import FloatArray, IntArray
 class WeightMatrixCSR(NamedTuple):
     """
     NamedTuple for easy ingestion by numba.
+
+    More or less matches the scipy.sparse.csr_matrix.
     """
 
     indptr: IntArray
