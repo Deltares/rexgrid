@@ -31,7 +31,7 @@ def create_weight_matrix(
     weights: FloatArray,
 ) -> WeightMatrixCSR:
     i = np.cumsum(np.bincount(target_index))
-    indptr = np.empty(i.size + 1)
+    indptr = np.empty(i.size + 1, dtype=np.intp)
     indptr[0] = 0
     indptr[1:] = i
     return WeightMatrixCSR(
