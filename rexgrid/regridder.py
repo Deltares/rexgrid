@@ -1,6 +1,4 @@
 """
-Types are your friend!
-
 Use xarray broadcasting for selection?
 
 1. structured -> structured
@@ -45,7 +43,7 @@ import abc
 from itertools import chain
 from typing import Callable, Optional, Tuple, Union
 
-import dask
+import dask.array
 import numba
 import numpy as np
 import xarray as xr
@@ -55,19 +53,6 @@ from . import reduce
 from .typing import FloatArray
 from .unstructured import UnstructuredGrid2d
 from .weight_matrix import WeightMatrixCSR, create_weight_matrix, nzrange
-
-
-def is_xarray(obj):
-    return isinstance(obj, xr.DataArray)
-
-
-def is_ugrid(obj):
-    return isinstance(obj, UgridDataArray)
-
-
-def _check_ugrid(a, b):
-    if a != b:
-        raise ValueError("grid does not match source grid of regridder")
 
 
 def _prepend(ds: xr.Dataset, prefix: str):
@@ -101,107 +86,10 @@ class BaseRegridder(abc.ABC):
             self.source_index, self.target_index, self.weights = weights
 
     @abc.abstractmethod
-    def compute_weights(self):
-        """
-        Compute the weights from source to target.
-        """
-
-    @abc.abstractmethod
-    def regrid(self, object):
-        """
-        Create a new object by regridding.
-        """
-
-    @abc.abstractmethod
     def to_dataset(self):
         """
         Store the computed weights in a dataset for re-use.
         """
-
-    @classmethod
-    def from_dataset(cls, dataset: xr.Dataset):
-        """
-        Reconstruct the regridder from a dataset with source, target indices
-        and weights.
-        """
-        source = Ugrid2d.from_dataset(_get_grid_variables(dataset, "__source__"))
-        target = Ugrid2d.from_dataset(_get_grid_variables(dataset, "__target__"))
-        weights = (
-            dataset["source_index"].values,
-            dataset["target_index"].values,
-            dataset["weights"].values,
-        )
-        return cls(
-            source,
-            target,
-            weights,
-        )
-
-
-class NearestRegridder(BaseRegridder):
-    def compute_weights(self):
-        tree = self.source_grid.celltree
-        self.source_index = tree.locate_points(self.target_grid.centroids)
-        self.weights = xr.DataArray(
-            data=np.where(self.source_index != -1, 1.0, np.nan),
-            dims=[self.target_grid.face_dimension],
-        )
-        return
-
-    def regrid(self, obj: UgridDataArray) -> UgridDataArray:
-        """
-        Regrid an object to the target grid topology.
-
-        Parameters
-        ----------
-        obj: UgridDataArray
-
-        Returns
-        -------
-        regridded: UgridDataArray
-            The data regridded to the target grid. The target grid has been set
-            as the face dimension.
-        """
-        grid = obj.ugrid.grid
-        facedim = grid.face_dimension
-        _check_ugrid(self.source_grid, grid)
-        da = obj.obj.isel({facedim: self.source_index})
-        da.name = obj.name
-        uda = UgridDataArray(da, self.target_grid)
-        uda = uda.rename({facedim: self.target_grid.face_dimension})
-        uda = uda * self.weights.values
-        return uda
-
-    def to_dataset(self) -> xr.Dataset:
-        source_ds = _prepend(self.source_grid.to_dataset(), "__source__")
-        target_ds = _prepend(self.target_grid.to_dataset(), "__target__")
-        regrid_ds = xr.Dataset(
-            {
-                "source_index": self.source_index,
-                "target_index": np.nan,
-                "weights": self.weights,
-            },
-        )
-        return xr.merge((source_ds, target_ds, regrid_ds))
-
-
-class OverlapRegridder:
-    """
-    Used for area or volume weighted means.
-    """
-
-    def __init__(
-        self,
-        source: UgridDataArray,
-        target: UgridDataArray,
-        method: Union[str, Callable] = "mean",
-        relative: bool = False,
-    ):
-        self.source: Ugrid2d = UnstructuredGrid2d(source)
-        self.target: Ugrid2d = UnstructuredGrid2d(target)
-        func = reduce.get_method(method, reduce.OVERLAP_METHODS)
-        self._setup_regrid(func)
-        self.compute_weights(relative)
 
     def _setup_regrid(self, func) -> None:
         """
@@ -278,6 +166,101 @@ class OverlapRegridder:
         )
         return out
 
+    def regrid(self, object) -> UgridDataArray:
+        regridded = self.regrid_dataarray(object)
+        return UgridDataArray(
+            regridded,
+            self.target.grid,
+        )
+
+    @classmethod
+    def from_dataset(cls, dataset: xr.Dataset):
+        """
+        Reconstruct the regridder from a dataset with source, target indices
+        and weights.
+        """
+        source = Ugrid2d.from_dataset(_get_grid_variables(dataset, "__source__"))
+        target = Ugrid2d.from_dataset(_get_grid_variables(dataset, "__target__"))
+        weights = (
+            dataset["source_index"].values,
+            dataset["target_index"].values,
+            dataset["weights"].values,
+        )
+        return cls(
+            source,
+            target,
+            weights,
+        )
+
+
+class NearestRegridder(BaseRegridder):
+    def compute_weights(self):
+        tree = self.source_grid.celltree
+        self.source_index = tree.locate_points(self.target_grid.centroids)
+        self.weights = xr.DataArray(
+            data=np.where(self.source_index != -1, 1.0, np.nan),
+            dims=[self.target_grid.face_dimension],
+        )
+        return
+
+    def regrid(self, obj: UgridDataArray) -> UgridDataArray:
+        """
+        Regrid an object to the target grid topology.
+
+        Parameters
+        ----------
+        obj: UgridDataArray
+
+        Returns
+        -------
+        regridded: UgridDataArray
+            The data regridded to the target grid. The target grid has been set
+            as the face dimension.
+        """
+        grid = obj.ugrid.grid
+        facedim = grid.face_dimension
+        da = obj.obj.isel({facedim: self.source_index})
+        da.name = obj.name
+        uda = UgridDataArray(da, self.target_grid)
+        uda = uda.rename({facedim: self.target_grid.face_dimension})
+        uda = uda * self.weights.values
+        return uda
+
+    def to_dataset(self) -> xr.Dataset:
+        source_ds = _prepend(self.source_grid.to_dataset(), "__source__")
+        target_ds = _prepend(self.target_grid.to_dataset(), "__target__")
+        regrid_ds = xr.Dataset(
+            {
+                "source_index": self.source_index,
+                "target_index": np.nan,
+                "weights": self.weights,
+            },
+        )
+        return xr.merge((source_ds, target_ds, regrid_ds))
+
+
+class OverlapRegridder(BaseRegridder):
+    """
+    Used for area or volume weighted means.
+    """
+
+    def __init__(
+        self,
+        source: UgridDataArray,
+        target: UgridDataArray,
+        method: Union[str, Callable] = "mean",
+        relative: bool = False,
+        weights: Optional[Tuple] = None,
+    ):
+        self.source: Ugrid2d = UnstructuredGrid2d(source)
+        self.target: Ugrid2d = UnstructuredGrid2d(target)
+        func = reduce.get_method(method, reduce.OVERLAP_METHODS)
+        self._setup_regrid(func)
+        if weights is None:
+            self.compute_weights(relative)
+        else:
+            self.source_index, self.target_index, self.weights = weights
+
     def compute_weights(self, relative):
         self.source_index, self.target_index, self.weights = self.source.overlap(
             self.target, relative
@@ -288,25 +271,38 @@ class OverlapRegridder:
         return
 
     @classmethod
-    def from_dataset(self, dataset: xr.Dataset):
+    def to_dataset(self, dataset: xr.Dataset):
         return
 
-    def regrid(self, object) -> UgridDataArray:
-        regridded = self.regrid_dataarray(object)
-        return UgridDataArray(
-            regridded,
-            self.target.grid,
+
+class BarycentricInterpolator(BaseRegridder):
+    def __init__(
+        self,
+        source: UgridDataArray,
+        target: UgridDataArray,
+        weights: Optional[Tuple] = None,
+    ):
+        self.source: Ugrid2d = UnstructuredGrid2d(source)
+        self.target: Ugrid2d = UnstructuredGrid2d(target)
+        # Since the weights for a target face sum up to 1.0, a weight mean is
+        # appropriate, and takes care of NaN values in the source data.
+        self._setup_regrid(reduce.mean)
+        if weights is None:
+            self.compute_weights()
+        else:
+            self.source_index, self.target_index, self.weights = weights
+
+    def compute_weights(self):
+        (
+            self.source_index,
+            self.target_index,
+            self.weights,
+        ) = self.source.barycentric(self.target)
+        self.csr_weights = create_weight_matrix(
+            self.target_index, self.source_index, self.weights
         )
+        return
 
-
-def to_ascending(obj):
-    """
-    Ensure all coordinates are (monotonic) ascending.
-    """
-    dims = obj.dims
-    keep = slice(None, None, 1)
-    flip = slice(None, None, -1)
-    slices = {
-        dim: flip if obj.indexes[dim].is_monotonic_increasing else keep for dim in dims
-    }
-    return obj.isel(slices)
+    @classmethod
+    def to_dataset(self, dataset: xr.Dataset):
+        return
